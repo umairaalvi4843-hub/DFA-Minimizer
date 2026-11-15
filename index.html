@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DFA Minimizer – Table-Filling Algorithm</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;600;700;800&family=Fira+Code:wght@500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header>
+        <h1>🧩 DFA Minimizer</h1>
+        <nav id="chips"></nav>
+        <button id="toggleIn" class="ghost">☰ Inputs</button>
+    </header>
+
+    <main id="main">
+        <aside class="panel" id="inputPanel">
+            <h2>🎒 Build your DFA</h2>
+            <label>Try an example</label><select id="preset"></select>
+            <label>States <em>(comma separated)</em></label><input id="states" placeholder="A,B,C">
+            <label>Alphabet</label><input id="alpha" placeholder="0,1">
+            <label>Start state</label><input id="start" placeholder="A">
+            <label>Final states</label><input id="finals" placeholder="C">
+            <label>Transitions <em>(from symbol to)</em></label>
+            <textarea id="trans" rows="8" spellcheck="false" placeholder="A 0 B"></textarea>
+            <button id="go" class="big">🚀 Minimize it!</button>
+            <div id="err" role="alert"></div>
+        </aside>
+
+        <section id="stage" class="single">
+            <div id="tape"></div>
+            <div id="stageBody">
+                <div id="card"></div>
+                <div id="graphs">
+                    <div class="gwrap" id="w1">
+                        <div class="gtag" id="t1"></div>
+                        <div id="g1" class="graph"></div>
+                    </div>
+                    <div class="gwrap" id="w2">
+                        <div class="gtag">Minimized DFA</div>
+                        <div id="g2" class="graph"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <aside class="panel" id="explain">
+            <div id="eIco">🤖</div>
+            <h2 id="eTitle">Welcome!</h2>
+            <p id="eSay">Press “Minimize it!” and I will explain every step in simple words.</p>
+            <div id="eTheory"></div>
+            <div class="ctrl">
+                <button id="prev">⏮ Prev</button>
+                <button id="auto">▶ Auto</button>
+                <button id="next">Next ⏭</button>
+            </div>
+            <div id="dots"></div>
+            <div id="eCount"></div>
+        </aside>
+    </main>
+
+    <footer>
+        <span class="ftitle">🧪 Test any string</span>
+        <input id="word" placeholder="any string, e.g. 0110  (empty box = ε)">
+        <span id="achips"></span>
+        <button id="eps" class="ghost">ε</button>
+        <button id="walk" class="big">👣 Walk it!</button>
+        <div id="res"></div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+
+</html>

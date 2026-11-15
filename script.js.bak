@@ -1,0 +1,1010 @@
+"use strict";
+const $ = (id) => document.getElementById(id);
+const list = (s) => s.split(/[\s,]+/).filter(Boolean);
+const esc = (s) =>
+  String(s).replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ],
+  );
+class VErr extends Error {}
+const PAL = [
+  "#ffc8dd",
+  "#ffe8a3",
+  "#bde0fe",
+  "#d4c1f5",
+  "#ffd6a5",
+  "#b9f3e4",
+  "#ffadad",
+  "#d9f2a6",
+];
+const PH = [
+  ["dfa", "① Your DFA"],
+  ["clean", "② Clean-up"],
+  ["table", "③ Table"],
+  ["merge", "④ Merge"],
+  ["string", "⑤ Test a string"],
+];
+const MAXLEN = 500;
+
+/* ---------- Examples ---------- */
+const PRESETS = {
+  "Classic: 6 states → 3": {
+    s: "A,B,C,D,E,F",
+    a: "0,1",
+    st: "A",
+    f: "C,D,E",
+    t: "A 0 B\nA 1 C\nB 0 A\nB 1 D\nC 0 E\nC 1 F\nD 0 E\nD 1 F\nE 0 E\nE 1 F\nF 0 F\nF 1 F",
+  },
+  "Edge 1: all states final": {
+    s: "P,Q,R",
+    a: "a,b",
+    st: "P",
+    f: "P,Q,R",
+    t: "P a Q\nP b R\nQ a R\nQ b P\nR a P\nR b Q",
+  },
+  "Edge 2: no final states": {
+    s: "P,Q,R",
+    a: "a,b",
+    st: "P",
+    f: "",
+    t: "P a Q\nP b R\nQ a R\nQ b P\nR a P\nR b Q",
+  },
+  "Edge 3: already minimal (ends in ab)": {
+    s: "q0,q1,q2",
+    a: "a,b",
+    st: "q0",
+    f: "q2",
+    t: "q0 a q1\nq0 b q0\nq1 a q1\nq1 b q2\nq2 a q1\nq2 b q0",
+  },
+  "Edge 4: unreachable final state": {
+    s: "A,B,X,Y",
+    a: "0,1",
+    st: "A",
+    f: "B,X",
+    t: "A 0 B\nA 1 A\nB 0 B\nB 1 A\nX 0 Y\nX 1 X\nY 0 X\nY 1 Y",
+  },
+  "Edge 5: single state": {
+    s: "S",
+    a: "0,1",
+    st: "S",
+    f: "S",
+    t: "S 0 S\nS 1 S",
+  },
+};
+Object.keys(PRESETS).forEach((k) => $("preset").add(new Option(k, k)));
+function loadPreset() {
+  const p = PRESETS[$("preset").value];
+  $("states").value = p.s;
+  $("alpha").value = p.a;
+  $("start").value = p.st;
+  $("finals").value = p.f;
+  $("trans").value = p.t;
+}
+$("preset").onchange = () => {
+  loadPreset();
+  run();
+};
+
+/* ---------- Validation ---------- */
+function parseDFA() {
+  const Q = list($("states").value),
+    Sg = list($("alpha").value),
+    q0 = $("start").value.trim(),
+    F = list($("finals").value);
+  const bad = [...Q, ...Sg, q0, ...F].find((x) => /[<>&"'`\\]/.test(x));
+  if (bad)
+    throw new VErr(
+      `“${bad}” contains a character that is not allowed (< > & " ' \` \\).`,
+    );
+  if (!Q.length) throw new VErr("Please enter at least one state.");
+  if (new Set(Q).size !== Q.length)
+    throw new VErr("Duplicate state names found. Each state must be unique.");
+  if (Q.includes("__s")) throw new VErr("“__s” is a reserved name.");
+  if (!Sg.length) throw new VErr("Please enter at least one alphabet symbol.");
+  if (new Set(Sg).size !== Sg.length)
+    throw new VErr("Duplicate symbols in the alphabet.");
+  if (!Q.includes(q0))
+    throw new VErr(
+      `Start state “${q0 || "(empty)"}” is not in the state list.`,
+    );
+  F.forEach((f) => {
+    if (!Q.includes(f))
+      throw new VErr(`Final state “${f}” is not in the state list.`);
+  });
+  const d = {};
+  Q.forEach((q) => (d[q] = Object.create(null)));
+  $("trans")
+    .value.split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .forEach((line, i) => {
+      const p = list(line);
+      if (p.length !== 3)
+        throw new VErr(
+          `Transition line ${i + 1} (“${line}”) must look like:  from symbol to`,
+        );
+      const [a, c, b] = p;
+      if (!Q.includes(a))
+        throw new VErr(`Line ${i + 1}: state “${a}” does not exist.`);
+      if (!Sg.includes(c))
+        throw new VErr(
+          `Line ${i + 1}: symbol “${c}” is not in the alphabet {${Sg}}.`,
+        );
+      if (!Q.includes(b))
+        throw new VErr(`Line ${i + 1}: target state “${b}” does not exist.`);
+      if (d[a][c] !== undefined)
+        throw new VErr(
+          `Line ${i + 1}: δ(${a}, ${c}) is defined twice – a DFA has exactly one move per symbol.`,
+        );
+      d[a][c] = b;
+    });
+  const miss = [];
+  Q.forEach((q) =>
+    Sg.forEach((c) => {
+      if (d[q][c] === undefined) miss.push(`δ(${q},${c})`);
+    }),
+  );
+  if (miss.length)
+    throw new VErr(
+      "Incomplete DFA – missing transitions: " +
+        miss.join(", ") +
+        ". (A dead/trap state can complete it.)",
+    );
+  return { Q, Sg, q0, F: new Set(F), d };
+}
+
+/* ---------- Algorithms ---------- */
+function bfsLayers(M) {
+  const seen = new Set([M.q0]);
+  let layer = [M.q0];
+  const layers = [];
+  while (layer.length) {
+    layers.push(layer);
+    const next = [];
+    layer.forEach((u) =>
+      M.Sg.forEach((c) => {
+        const v = M.d[u][c];
+        if (!seen.has(v)) {
+          seen.add(v);
+          next.push(v);
+        }
+      }),
+    );
+    layer = next;
+  }
+  return { layers, seen };
+}
+function fillTable(R) {
+  const { Q, Sg, F, d } = R,
+    n = Q.length,
+    idx = {};
+  Q.forEach((q, i) => (idx[q] = i));
+  const marks = new Map(),
+    rounds = [],
+    key = (a, b) => Math.max(a, b) + "-" + Math.min(a, b);
+  if (n < 2) return { marks, rounds };
+  let news = [];
+  for (let i = 1; i < n; i++)
+    for (let j = 0; j < i; j++)
+      if (F.has(Q[i]) !== F.has(Q[j])) {
+        const f = F.has(Q[i]) ? i : j,
+          g = F.has(Q[i]) ? j : i;
+        news.push({
+          k: key(i, j),
+          i,
+          j,
+          why: `${Q[f]} is a happy (final) state but ${Q[g]} is not`,
+        });
+      }
+  news.forEach((m) => marks.set(m.k, { r: 1, why: m.why }));
+  rounds.push(news);
+  for (let r = 2; ; r++) {
+    news = [];
+    for (let i = 1; i < n; i++)
+      for (let j = 0; j < i; j++) {
+        if (marks.has(key(i, j))) continue;
+        for (const c of Sg) {
+          const a = idx[d[Q[i]][c]],
+            b = idx[d[Q[j]][c]];
+          if (a !== b && marks.has(key(a, b))) {
+            news.push({
+              k: key(i, j),
+              i,
+              j,
+              why: `on “${c}” ${Q[i]} goes to ${Q[a]} but ${Q[j]} goes to ${Q[b]}, and {${Q[b]},${Q[a]}} is already ✖`,
+            });
+            break;
+          }
+        }
+      }
+    if (!news.length) break;
+    news.forEach((m) => marks.set(m.k, { r, why: m.why }));
+    rounds.push(news);
+  }
+  return { marks, rounds };
+}
+function buildMin(R, marks) {
+  const Q = R.Q,
+    n = Q.length,
+    par = Q.map((_, i) => i);
+  const find = (x) => (par[x] === x ? x : (par[x] = find(par[x])));
+  for (let i = 1; i < n; i++)
+    for (let j = 0; j < i; j++)
+      if (!marks.has(i + "-" + j)) par[find(i)] = find(j);
+  const nameOf = {},
+    groups = [];
+  Q.forEach((q, i) => {
+    const r = find(i);
+    if (nameOf[r] === undefined) {
+      nameOf[r] = "S" + groups.length;
+      groups.push({ name: nameOf[r], members: [] });
+    }
+    groups[+nameOf[r].slice(1)].members.push(q);
+  });
+  const g = (q) => nameOf[find(Q.indexOf(q))],
+    d = {},
+    F = new Set(),
+    of = {};
+  Q.forEach((q) => (of[q] = g(q)));
+  groups.forEach((G) => {
+    const rep = G.members[0];
+    d[G.name] = {};
+    R.Sg.forEach((c) => (d[G.name][c] = g(R.d[rep][c])));
+    if (R.F.has(rep)) F.add(G.name);
+  });
+  return {
+    Q: groups.map((G) => G.name),
+    Sg: R.Sg,
+    q0: g(R.q0),
+    F,
+    d,
+    groups,
+    of,
+  };
+}
+
+/* ---------- Built-in SVG graph (no libraries, drag nodes to move them) ---------- */
+const W = 640,
+  H = 420,
+  NR = 26,
+  NS = "http://www.w3.org/2000/svg";
+function look(isF, tag) {
+  let fill = isF ? "#c8f0d4" : "#d7ebff",
+    stroke = isF ? "#6cc58f" : "#8cc0ee",
+    dash = "",
+    op = 1,
+    sw = 3;
+  if (tag === "dead") {
+    fill = "#ffe3e8";
+    stroke = "#f08a99";
+    dash = "6 5";
+    op = 0.65;
+  } else if (tag === "seen") {
+    stroke = "#f0b429";
+    sw = 5;
+  } else if (tag === "active") {
+    fill = "#ffe8a3";
+    stroke = "#f0b429";
+    sw = 5;
+  } else if (tag === "hot") {
+    fill = "#ffd6a5";
+    stroke = "#f29b4b";
+    sw = 5;
+  } else if (tag && tag[0] === "g") {
+    fill = PAL[+tag.slice(1) % PAL.length];
+    stroke = "#7c6aa8";
+  }
+  return { fill, stroke, dash, op, sw };
+}
+function makeGraph(el, M, old) {
+  const n = M.Q.length,
+    pos = {};
+  M.Q.forEach((q, i) => {
+    pos[q] =
+      old && old[q]
+        ? { ...old[q] }
+        : n === 1
+          ? { x: W / 2, y: H / 2 }
+          : {
+              x:
+                W / 2 +
+                Math.cos((2 * Math.PI * i) / n - Math.PI / 2) * (W / 2 - 120),
+              y:
+                H / 2 +
+                Math.sin((2 * Math.PI * i) / n - Math.PI / 2) * (H / 2 - 85),
+            };
+  });
+  el.innerHTML = "";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  el.appendChild(svg);
+  const g = { el, svg, M, pos, tags: {}, hot: [] };
+  let drag = null;
+  const toSvg = (e) => {
+    const r = svg.getBoundingClientRect(),
+      s = Math.min(r.width / W, r.height / H) || 1;
+    return {
+      x: (e.clientX - r.left - (r.width - W * s) / 2) / s,
+      y: (e.clientY - r.top - (r.height - H * s) / 2) / s,
+    };
+  };
+  svg.addEventListener("pointerdown", (e) => {
+    const n = e.target.closest("[data-q]");
+    if (!n) return;
+    drag = n.dataset.q;
+    try {
+      svg.setPointerCapture(e.pointerId);
+    } catch (_) {}
+  });
+  svg.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const p = toSvg(e);
+    pos[drag] = {
+      x: Math.max(NR, Math.min(W - NR, p.x)),
+      y: Math.max(NR, Math.min(H - NR, p.y)),
+    };
+    draw(g);
+  });
+  const end = () => {
+    drag = null;
+  };
+  svg.addEventListener("pointerup", end);
+  svg.addEventListener("pointercancel", end);
+  draw(g);
+  return g;
+}
+function draw(g) {
+  const { M, pos } = g,
+    qs = M.Q;
+  const cx = qs.reduce((s, q) => s + pos[q].x, 0) / qs.length,
+    cy = qs.reduce((s, q) => s + pos[q].y, 0) / qs.length;
+  const grouped = new Map();
+  qs.forEach((a) =>
+    M.Sg.forEach((c) => {
+      const b = M.d[a][c],
+        k = a + ">" + b;
+      if (!grouped.has(k)) grouped.set(k, { a, b, l: [] });
+      grouped.get(k).l.push(c);
+    }),
+  );
+  let edges = "",
+    nodes = "";
+  const f = (v) => v.toFixed(1);
+  grouped.forEach(({ a, b, l }, k) => {
+    const hot = g.hot.includes(k),
+      col = hot ? "#f0a000" : "#9a8fc4",
+      w = hot ? 5 : 2.5,
+      A = pos[a],
+      B = pos[b];
+    let d, lx, ly;
+    if (a === b) {
+      let ox = A.x - cx,
+        oy = A.y - cy,
+        L = Math.hypot(ox, oy);
+      if (L < 1) {
+        ox = 0;
+        oy = -1;
+        L = 1;
+      }
+      ox /= L;
+      oy /= L;
+      const px = -oy,
+        py = ox,
+        S = NR;
+      const s = [
+          A.x + ox * S * 0.8 + px * S * 0.6,
+          A.y + oy * S * 0.8 + py * S * 0.6,
+        ],
+        e = [
+          A.x + ox * S * 0.8 - px * S * 0.6,
+          A.y + oy * S * 0.8 - py * S * 0.6,
+        ];
+      const c1 = [
+          A.x + ox * S * 3.4 + px * S * 1.6,
+          A.y + oy * S * 3.4 + py * S * 1.6,
+        ],
+        c2 = [
+          A.x + ox * S * 3.4 - px * S * 1.6,
+          A.y + oy * S * 3.4 - py * S * 1.6,
+        ];
+      d = `M${f(s[0])} ${f(s[1])} C${f(c1[0])} ${f(c1[1])} ${f(c2[0])} ${f(c2[1])} ${f(e[0])} ${f(e[1])}`;
+      lx = A.x + ox * (S * 2.75 + 14);
+      ly = A.y + oy * (S * 2.75 + 14);
+    } else {
+      const dx = B.x - A.x,
+        dy = B.y - A.y,
+        L = Math.hypot(dx, dy) || 1,
+        mx = (A.x + B.x) / 2 + (-dy / L) * 56,
+        my = (A.y + B.y) / 2 + (dx / L) * 56;
+      const u = (P, T, r) => {
+        const vx = T[0] - P.x,
+          vy = T[1] - P.y,
+          m = Math.hypot(vx, vy) || 1;
+        return [P.x + (vx / m) * r, P.y + (vy / m) * r];
+      };
+      const s = u(A, [mx, my], NR),
+        e = u(B, [mx, my], NR + 5);
+      d = `M${f(s[0])} ${f(s[1])} Q${f(mx)} ${f(my)} ${f(e[0])} ${f(e[1])}`;
+      lx = 0.25 * s[0] + 0.5 * mx + 0.25 * e[0];
+      ly = 0.25 * s[1] + 0.5 * my + 0.25 * e[1];
+    }
+    edges +=
+      `<g class="ge"><path d="${d}" fill="none" stroke="${col}" stroke-width="${w}" marker-end="url(#${hot ? "ah" : "an"})"/>` +
+      `<text x="${f(lx)}" y="${f(ly)}" text-anchor="middle" dominant-baseline="middle">${l.map(esc).join(", ")}</text></g>`;
+  });
+  qs.forEach((q) => {
+    const p = pos[q],
+      t = look(M.F.has(q), g.tags[q]);
+    nodes +=
+      `<g class="gn" data-q="${esc(q)}" opacity="${t.op}"><circle cx="${f(p.x)}" cy="${f(p.y)}" r="${NR}" fill="${t.fill}" stroke="${t.stroke}" stroke-width="${t.sw}"${t.dash ? ` stroke-dasharray="${t.dash}"` : ""}/>` +
+      (M.F.has(q)
+        ? `<circle cx="${f(p.x)}" cy="${f(p.y)}" r="${NR - 6}" fill="none" stroke="${t.stroke}" stroke-width="2"/>`
+        : "") +
+      `<text x="${f(p.x)}" y="${f(p.y)}" text-anchor="middle" dominant-baseline="central">${esc(q)}</text></g>`;
+  });
+  const s0 = pos[M.q0];
+  const start =
+    `<line x1="${f(s0.x - NR - 46)}" y1="${f(s0.y)}" x2="${f(s0.x - NR - 3)}" y2="${f(s0.y)}" stroke="#f0a000" stroke-width="3.5" marker-end="url(#ah)"/>` +
+    `<text x="${f(s0.x - NR - 48)}" y="${f(s0.y - 10)}" text-anchor="middle" style="font:700 14px var(--ui);fill:#c58a00">start</text>`;
+  const mk = (id, c) =>
+    `<marker id="${id}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="${c}"/></marker>`;
+  g.svg.innerHTML = `<defs>${mk("an", "#9a8fc4")}${mk("ah", "#f0a000")}</defs>${edges}${start}${nodes}`;
+}
+let G = {};
+function ensure(slot, M, el) {
+  const cur = G[slot];
+  if (cur && cur.M === M) return cur;
+  return (G[slot] = makeGraph(el, M, cur ? cur.pos : null));
+}
+function paint(g, tags, hot) {
+  g.tags = tags || {};
+  g.hot = hot || [];
+  draw(g);
+}
+
+/* ---------- Scenes ---------- */
+let M,
+  R,
+  MIN,
+  marks,
+  rounds,
+  S = [],
+  cur = 0,
+  baseN = 0,
+  timer = null;
+const groupTags = (Q, of) =>
+  Object.fromEntries(Q.map((q) => [q, "g" + (of ? of[q] : q).slice(1)]));
+const pairTxt = (m) => `{${R.Q[m.j]}, ${R.Q[m.i]}}`;
+
+function buildScenes(layers, seen) {
+  const out = [],
+    n = R.Q.length,
+    dead = M.Q.filter((q) => !seen.has(q));
+  const add = (ph, ico, title, say, theory, v = {}, fx) =>
+    out.push({ ph, ico, title, say, theory, v: { g1: "reach", ...v }, fx });
+  const fin = [...M.F];
+  add(
+    "dfa",
+    "👋",
+    "Meet your DFA",
+    `This machine has <b>${M.Q.length} states</b>. It starts at <b>${M.q0}</b> (yellow arrow). A string is <b>accepted</b> if the machine stops on a <b>green double-circled</b> state${fin.length ? ": " + fin.join(", ") : " – but there are none, so nothing is ever accepted"}.<br><br>Our job: build the <b>smallest</b> machine that accepts exactly the same strings. Try dragging the circles!`,
+    "A DFA is a 5-tuple (Q, Σ, δ, q0, F). Every state has exactly one arrow for every symbol. Minimization gives the unique smallest DFA for the same language.",
+    { g1: "full" },
+  );
+  const lit = {};
+  layers.forEach((L, k) => {
+    L.forEach((q) => (lit[q] = "seen"));
+    add(
+      "clean",
+      "🔦",
+      k ? `Torch: step ${k}` : "Shine a torch from the start",
+      k
+        ? `Follow one more arrow from the lit states. The torch now reaches: <b>${L.join(", ")}</b>.`
+        : `Imagine a torch on the start state <b>${M.q0}</b>. We shine it along every arrow, layer by layer, to see which states can actually be <i>visited</i>.`,
+      "This is a breadth-first search (BFS) over the transition graph from q0. Cost: O(|Q|·|Σ|).",
+      { g1: "full", t1: { ...lit } },
+    );
+  });
+  if (dead.length) {
+    const dt = { ...lit };
+    dead.forEach((q) => (dt[q] = "dead"));
+    const df = dead.filter((q) => M.F.has(q));
+    add(
+      "clean",
+      "🗑️",
+      "Unreachable states found",
+      `<b>${dead.join(", ")}</b> ${dead.length > 1 ? "were" : "was"} never lit. No string can ever get there${df.length ? " – even though " + df.join(", ") + (df.length > 1 ? " are" : " is") + " green" : ""}. They are useless, so out they go!`,
+      "A state q is useless if no w gives δ*(q0,w)=q. Removing it never changes the language – and it must happen BEFORE the table.",
+      { g1: "full", t1: dt },
+    );
+    add(
+      "clean",
+      "🧹",
+      "Cleaned up!",
+      `Removed <b>${dead.join(", ")}</b>. We continue with <b>${n}</b> state${n > 1 ? "s" : ""}.`,
+      "",
+      { g1: "reach" },
+    );
+  } else
+    add(
+      "clean",
+      "✅",
+      "Nothing to remove",
+      `Every state was lit, so all <b>${n}</b> are reachable. No clean-up needed.`,
+      "",
+      { g1: "reach" },
+    );
+
+  const last = rounds.length + 1;
+  if (n < 2)
+    add(
+      "table",
+      "🎈",
+      "Only one state!",
+      "With a single state there is nobody to compare, so the table is skipped. This DFA is already as small as it can be.",
+      "A 1-state DFA is trivially minimal.",
+    );
+  else
+    for (let s = 0; s <= last; s++) {
+      let ico = "🔴",
+        title,
+        say,
+        th = "",
+        t1 = {};
+      if (s === 0) {
+        ico = "📋";
+        title = "The pair table";
+        say =
+          "One box for every <b>pair</b> of states. Dots mean “not checked yet”. We cross out (✖) pairs that behave differently. Pairs that survive are <b>twins</b>.";
+        th =
+          "Pair {p,q} is distinguishable if some string w makes exactly one of δ*(p,w), δ*(q,w) final. Equivalent states can be merged.";
+      } else if (s === 1) {
+        title = "Round 1: final vs not-final";
+        const r1 = rounds[0];
+        say = r1.length
+          ? `If one state is <b>final</b> and the other is not, they can never be twins: the <b>empty string</b> already tells them apart. Crossed out: <b>${r1.map(pairTxt).join("  ")}</b>.`
+          : (R.F.size === 0
+              ? "<b>None</b> of the states is final, so nobody can be told apart: every state rejects everything."
+              : "Every state is final, so nobody can be told apart: every state accepts everything.") +
+            " No ✖ at all!";
+        th = "Base case: |{p,q} ∩ F| = 1 ⇒ ε distinguishes p and q.";
+      } else if (s <= rounds.length) {
+        title = `Round ${s}: follow the arrows`;
+        say =
+          `Look only at pairs still ✔. Follow the <b>same symbol</b> from both states. If they land on a pair that is already ✖, they cannot be twins.<br>` +
+          rounds[s - 1]
+            .slice(0, 3)
+            .map((m) => `• <b>${pairTxt(m)}</b>: ${m.why}`)
+            .join("<br>") +
+          (rounds[s - 1].length > 3
+            ? `<br>…and ${rounds[s - 1].length - 3} more.`
+            : "");
+        th =
+          "If {δ(p,a), δ(q,a)} is distinguishable by x, then a·x distinguishes {p,q}. Repeat until nothing changes.";
+      } else {
+        ico = "🛑";
+        title = "Nothing new – table is stable";
+        const tw = [];
+        for (let i = 1; i < n; i++)
+          for (let j = 0; j < i; j++)
+            if (!marks.has(i + "-" + j)) tw.push(`{${R.Q[j]}, ${R.Q[i]}}`);
+        say = tw.length
+          ? `A full round crossed out nothing, so we stop. The pairs still ✔ are <b>twins</b>: ${tw.join("  ")}. They behave identically forever!`
+          : "A full round crossed out nothing. <b>Every</b> pair got ✖ – there are no twins, so nothing can be merged.";
+        th =
+          "Unmarked pairs are exactly the equivalent states (Myhill–Nerode). Equivalence is transitive, so twins form groups.";
+      }
+      if (s >= 1 && s <= rounds.length)
+        rounds[s - 1].forEach((m) => {
+          t1[R.Q[m.i]] = "hot";
+          t1[R.Q[m.j]] = "hot";
+        });
+      add("table", ico, title, say, th, { t1, table: s });
+    }
+  const mergeNote =
+    MIN.Q.length === n
+      ? n < 2
+        ? "The single state stays as it is."
+        : "Every pair got ✖, so <b>nothing merges</b>: this DFA is <b>already minimal</b>. The right picture is the same machine, just renamed S0, S1…"
+      : R.F.size === n
+        ? "Every state is final, so the machine accepts <b>everything</b>. One final state with loops is enough!"
+        : R.F.size === 0
+          ? "No state is final, so the machine accepts <b>nothing</b>. One non-final state is enough!"
+          : `${n} states became <b>${MIN.Q.length}</b>. Each group is now ONE state.`;
+  const groupsTxt = MIN.groups
+    .map(
+      (g) =>
+        `<span class="sw" style="background:${PAL[+g.name.slice(1) % PAL.length]}"></span><b>${g.name}</b> = {${g.members}}`,
+    )
+    .join("<br>");
+  if (n > 1)
+    add(
+      "merge",
+      "🎨",
+      "Twins share a colour",
+      `Twins get the same colour:<br>${groupsTxt}`,
+      "Equivalence classes of ≡ become the states of the minimal DFA: [q] = {p : p ≡ q}.",
+      { t1: groupTags(R.Q, MIN.of), table: last },
+    );
+  add(
+    "merge",
+    "🎉",
+    "The minimized DFA",
+    `${mergeNote}<br><br>New transitions: take any member of a group, see where it goes, and point to that target's group (see the table).`,
+    "δ′([q], a) = [δ(q,a)], F′ = {[q] : q ∈ F}, q0′ = [q0]. Well-defined because twins always move to twins.",
+    {
+      dual: true,
+      t1: groupTags(R.Q, MIN.of),
+      t2: groupTags(MIN.Q),
+      minTbl: true,
+    },
+    MIN.Q.length < n ? "party" : null,
+  );
+  return out;
+}
+
+/* ---------- String walk-through ---------- */
+function tokenize(w, Sg) {
+  w = w.replace(/\s+/g, "");
+  if (w === "" || w === "ε" || /^eps(ilon)?$/i.test(w)) return [];
+  const syms = [...Sg].sort((a, b) => b.length - a.length),
+    out = [];
+  let i = 0;
+  while (i < w.length) {
+    const s = syms.find((x) => w.startsWith(x, i));
+    if (!s)
+      throw new VErr(
+        `Symbol “${[...w.slice(i)][0]}” (position ${i + 1}) is not in the alphabet {${Sg.join(", ")}}.`,
+      );
+    out.push(s);
+    i += s.length;
+  }
+  return out;
+}
+function sim(Mc, toks) {
+  let q = Mc.q0;
+  const path = [q];
+  toks.forEach((t) => {
+    q = Mc.d[q][t];
+    path.push(q);
+  });
+  return { path, acc: Mc.F.has(q) };
+}
+function walkScenes(toks, A, B) {
+  const out = [],
+    word = toks.length ? toks.join("") : "ε",
+    shown = word.length > 30 ? word.slice(0, 30) + "…" : word;
+  const V = (i) => ({
+    dual: true,
+    t1: { [A.path[i]]: "active" },
+    t2: { [B.path[i]]: "active" },
+    tape: { toks, pos: i },
+  });
+  out.push({
+    ph: "string",
+    ico: "🏁",
+    title: "Start the walk",
+    say: toks.length
+      ? `Your string is <b>“${esc(shown)}”</b> – ${toks.length} symbol${toks.length > 1 ? "s" : ""}. Both machines start on their start state: <b>${A.path[0]}</b> (original) and <b>${B.path[0]}</b> (minimized).`
+      : `Your string is the <b>empty string ε</b> – there is nothing to read! Both machines just stay on their start state.`,
+    theory:
+      "δ*(q, ε) = q and δ*(q, wa) = δ(δ*(q, w), a). The string is accepted iff δ*(q0, w) ∈ F.",
+    v: V(0),
+  });
+  toks.forEach((t, i) => {
+    const p = A.path[i],
+      q = A.path[i + 1],
+      P = B.path[i],
+      Q2 = B.path[i + 1],
+      v = V(i + 1);
+    v.e1 = [p + ">" + q];
+    v.e2 = [P + ">" + Q2];
+    const mem = MIN.groups.find((g) => g.name === Q2).members;
+    out.push({
+      ph: "string",
+      ico: "👣",
+      title: `Read “${t}” (${i + 1} of ${toks.length})`,
+      say: `Original: from <b>${p}</b> follow the <b>${t}</b> arrow to <b>${q}</b>.<br>Minimized: from <b>${P}</b> follow <b>${t}</b> to <b>${Q2}</b>.<br><br><b>${Q2}</b> is a badge for the twins {${mem}}${mem.includes(q) ? ` – and ${q} is one of them ✔` : ""}.`,
+      theory: `δ(${p}, ${t}) = ${q}   ·   δ′(${P}, ${t}) = ${Q2}`,
+      v,
+    });
+  });
+  const qf = A.path[A.path.length - 1],
+    Qf = B.path[B.path.length - 1],
+    trap = !R.F.has(qf) && R.Sg.every((c) => R.d[qf][c] === qf),
+    same = A.acc === B.acc;
+  out.push({
+    ph: "string",
+    ico: A.acc ? "✅" : "❌",
+    title: A.acc ? "ACCEPTED!" : "REJECTED!",
+    say:
+      `${toks.length ? "The string ended" : "With ε we never moved"} on <b>${qf}</b> (original) and <b>${Qf}</b> (minimized). ${A.acc ? "That is a <b>final</b> state → <b>accepted</b>." : "That is <b>not final</b> → <b>rejected</b>."}` +
+      (!toks.length
+        ? " (ε is accepted only if the start state is final.)"
+        : "") +
+      (trap
+        ? `<br><br>🕳️ <b>${qf}</b> is a <b>trap</b>: every arrow loops back, so you can never reach a final state again.`
+        : "") +
+      `<br><br>${same ? "🤝 Both machines agree – exactly what “same language” means!" : "⚠️ The machines disagree (this should never happen)."}`,
+    theory: "w ∈ L(M) ⟺ δ*(q0,w) ∈ F  ⟺  δ′*(q0′,w) ∈ F′  ⟺  w ∈ L(M′)",
+    v: { ...V(toks.length), e1: [], e2: [] },
+    fx: A.acc ? "party" : null,
+  });
+  return out;
+}
+
+/* ---------- Run / show ---------- */
+function run() {
+  stopAuto();
+  $("err").textContent = "";
+  $("err").classList.remove("shake");
+  try {
+    M = parseDFA();
+    const { layers, seen } = bfsLayers(M);
+    R = {
+      ...M,
+      Q: M.Q.filter((q) => seen.has(q)),
+      F: new Set([...M.F].filter((q) => seen.has(q))),
+    };
+    ({ marks, rounds } = fillTable(R));
+    MIN = buildMin(R, marks);
+    G = {};
+    $("g1").innerHTML = "";
+    $("g2").innerHTML = "";
+    S = buildScenes(layers, seen);
+    baseN = S.length;
+    cur = 0;
+    $("res").innerHTML = "";
+    $("achips").innerHTML = M.Sg.map(
+      (c) => `<button data-c="${esc(c)}">${esc(c)}</button>`,
+    ).join("");
+    show();
+  } catch (e) {
+    $("err").textContent =
+      "⚠️ " +
+      (e instanceof VErr ? e.message : "Something went wrong: " + e.message);
+    void $("err").offsetWidth;
+    $("err").classList.add("shake");
+    if (!(e instanceof VErr)) console.error(e);
+  }
+}
+function pairTable(s) {
+  const Q = R.Q,
+    n = Q.length;
+  let h =
+    '<table class="pt"><tr><th></th>' +
+    Q.slice(0, n - 1)
+      .map((q) => `<th>${q}</th>`)
+      .join("") +
+    "</tr>";
+  for (let i = 1; i < n; i++) {
+    h += `<tr><th>${Q[i]}</th>`;
+    for (let j = 0; j < n - 1; j++) {
+      if (j >= i) {
+        h += '<td class="void"></td>';
+        continue;
+      }
+      const m = marks.get(i + "-" + j),
+        at = `data-i="${i}" data-j="${j}"`;
+      if (m && m.r <= s)
+        h += `<td ${at} class="x${m.r === s ? " pop" : ""}" data-why="✖ Different! ${m.why} (round ${m.r}).">✖</td>`;
+      else if (s === 0)
+        h += `<td ${at} class="wait" data-why="Not checked yet.">·</td>`;
+      else
+        h += `<td ${at} class="ok" data-why="${s > rounds.length ? "✔ Twins! No string can tell them apart, so they merge." : "✔ Not told apart so far…"}">✔</td>`;
+    }
+    h += "</tr>";
+  }
+  return h + "</table>";
+}
+function minTable() {
+  return (
+    '<h3>✨ New transition table</h3><table class="mt"><tr><th>State</th><th>Twins</th>' +
+    MIN.Sg.map((c) => `<th>${esc(c)}</th>`).join("") +
+    "</tr>" +
+    MIN.groups
+      .map(
+        (g) =>
+          `<tr><td><span class="sw" style="background:${PAL[+g.name.slice(1) % PAL.length]}"></span>${g.name === MIN.q0 ? "→" : ""}${MIN.F.has(g.name) ? "*" : ""}${g.name}</td><td>{${g.members}}</td>` +
+          MIN.Sg.map((c) => `<td>${MIN.d[g.name][c]}</td>`).join("") +
+          "</tr>",
+      )
+      .join("") +
+    "</table><small>→ start · * final</small>"
+  );
+}
+function show() {
+  const sc = S[cur],
+    v = sc.v,
+    dual = !!v.dual,
+    card = v.table != null || v.minTbl;
+  $("eIco").textContent = sc.ico;
+  $("eTitle").textContent = sc.title;
+  $("eSay").innerHTML = sc.say;
+  $("eTheory").innerHTML = sc.theory
+    ? `<b>📘 Theory corner</b><br>${sc.theory}`
+    : "";
+  $("stage").className =
+    (dual ? "dual" : "single") +
+    (card ? " hascard" : "") +
+    (v.tape ? " hastape" : "");
+  const g1 = ensure(1, v.g1 === "full" ? M : R, $("g1"));
+  $("t1").textContent =
+    v.g1 === "full" ? "Your DFA (all states)" : "DFA (reachable states)";
+  paint(g1, v.t1, v.e1);
+  if (dual) {
+    const g2 = ensure(2, MIN, $("g2"));
+    paint(g2, v.t2, v.e2);
+  }
+  $("card").innerHTML = v.minTbl
+    ? minTable()
+    : v.table != null
+      ? `<h3>🔍 Pair table</h3>${pairTable(v.table)}<p id="tip">👆 Hover or click a cell to see why.</p>`
+      : "";
+  $("tape").innerHTML = v.tape
+    ? "<b>Input tape:</b>" +
+      (v.tape.toks.length
+        ? v.tape.toks
+            .map(
+              (t, i) =>
+                `<span class="tok ${i < v.tape.pos ? "done" : i === v.tape.pos ? "now" : ""}">${esc(t)}</span>`,
+            )
+            .join("") + (v.tape.pos >= v.tape.toks.length ? " ⏹ end" : "")
+        : '<span class="tok eps">ε (empty string)</span>')
+    : "";
+  $("chips").innerHTML = PH.map(
+    ([id, label]) =>
+      `<button class="chip ${sc.ph === id ? "on" : ""} ${id === "string" && S.length === baseN ? "dis" : ""}" data-ph="${id}">${label}</button>`,
+  ).join("");
+  $("dots").innerHTML = S.map(
+    (s, k) =>
+      `<i data-k="${k}" class="${k < cur ? "done" : k === cur ? "now" : ""}"></i>`,
+  ).join("");
+  $("eCount").textContent = `Scene ${cur + 1} of ${S.length}  ·  use ← → keys`;
+  $("prev").disabled = cur === 0;
+  $("next").disabled = cur === S.length - 1;
+  const now = $("dots").querySelector(".now");
+  if (now && now.scrollIntoView) now.scrollIntoView({ block: "nearest" });
+  if (sc.fx === "party") celebrate();
+}
+$("card").addEventListener("mouseover", (e) => {
+  const td = e.target.closest("td[data-i]");
+  if (!td || !G[1]) return;
+  paint(G[1], { [R.Q[+td.dataset.i]]: "hot", [R.Q[+td.dataset.j]]: "hot" }, []);
+});
+$("card").addEventListener("mouseout", (e) => {
+  if (e.target.closest("td[data-i]") && G[1]) paint(G[1], S[cur].v.t1, []);
+});
+$("card").addEventListener("click", (e) => {
+  const td = e.target.closest("td[data-i]");
+  if (!td) return;
+  document
+    .querySelectorAll(".pt td.sel")
+    .forEach((x) => x.classList.remove("sel"));
+  td.classList.add("sel");
+  $("tip").innerHTML =
+    `<b>{${R.Q[+td.dataset.j]}, ${R.Q[+td.dataset.i]}}</b><br>${td.dataset.why}`;
+});
+function celebrate() {
+  for (let i = 0; i < 30; i++) {
+    const c = document.createElement("span");
+    c.className = "conf";
+    c.textContent = ["🎉", "⭐", "✨", "🎈", "💎", "🌈"][i % 6];
+    c.style.left = Math.random() * 100 + "vw";
+    c.style.animationDuration = 2 + Math.random() * 2 + "s";
+    document.body.appendChild(c);
+    setTimeout(() => c.remove(), 4500);
+  }
+}
+
+/* ---------- Controls ---------- */
+const step = (k) => {
+  if (cur + k >= 0 && cur + k < S.length) {
+    cur += k;
+    show();
+  }
+};
+function stopAuto() {
+  clearInterval(timer);
+  timer = null;
+  $("auto").textContent = "▶ Auto";
+}
+$("prev").onclick = () => {
+  stopAuto();
+  step(-1);
+};
+$("next").onclick = () => {
+  stopAuto();
+  step(1);
+};
+$("auto").onclick = () => {
+  if (!S.length) return;
+  if (timer) return stopAuto();
+  if (cur === S.length - 1) {
+    cur = 0;
+    show();
+  }
+  $("auto").textContent = "⏸ Pause";
+  timer = setInterval(() => {
+    if (cur >= S.length - 1) stopAuto();
+    else step(1);
+  }, 3200);
+};
+$("dots").onclick = (e) => {
+  if (e.target.dataset.k !== undefined) {
+    stopAuto();
+    cur = +e.target.dataset.k;
+    show();
+  }
+};
+$("chips").onclick = (e) => {
+  const ph = e.target.dataset.ph;
+  if (!ph) return;
+  stopAuto();
+  const k = S.findIndex((s) => s.ph === ph);
+  if (k >= 0) {
+    cur = k;
+    show();
+  } else $("word").focus();
+};
+$("toggleIn").onclick = () => $("main").classList.toggle("noin");
+$("go").onclick = run;
+document.addEventListener("keydown", (e) => {
+  if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || !S.length) return;
+  if (e.key === "ArrowRight") {
+    stopAuto();
+    step(1);
+  }
+  if (e.key === "ArrowLeft") {
+    stopAuto();
+    step(-1);
+  }
+});
+
+/* ---------- String test bar ---------- */
+$("achips").onclick = (e) => {
+  const b = e.target.closest("button");
+  if (b) {
+    $("word").value += b.dataset.c;
+    $("word").focus();
+  }
+};
+$("eps").onclick = () => {
+  $("word").value = "";
+  walk();
+};
+$("walk").onclick = walk;
+$("word").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") walk();
+});
+function walk() {
+  try {
+    if (!S.length) run();
+    if (!S.length) return;
+    const toks = tokenize($("word").value, R.Sg);
+    if (toks.length > MAXLEN)
+      throw new VErr(
+        `Please keep the string to ${MAXLEN} symbols or fewer for the step-by-step walkthrough.`,
+      );
+    const A = sim(R, toks),
+      B = sim(MIN, toks);
+    S = S.slice(0, baseN).concat(walkScenes(toks, A, B));
+    cur = baseN;
+    stopAuto();
+    const pill = (nm, r) =>
+      `<span class="pill ${r.acc ? "acc" : "rej"}">${nm}: ${r.acc ? "✅ ACCEPT" : "❌ REJECT"}</span>`;
+    $("res").innerHTML =
+      pill("Original", A) +
+      pill("Minimized", B) +
+      `<span class="pill match">${A.acc === B.acc ? "🤝 Same answer!" : "⚠️ MISMATCH"}</span>`;
+    show();
+  } catch (e) {
+    $("res").innerHTML = `<span class="pill rej">⚠️ ${esc(e.message)}</span>`;
+    if (!(e instanceof VErr)) console.error(e);
+  }
+}
+loadPreset();
+run();
